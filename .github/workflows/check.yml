@@ -1,0 +1,29 @@
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+name: Check
+env:
+  GOPRIVATE: "github.com/meow-io"
+  GH_ACCESS_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/setup-go@v3
+      with:
+        go-version: 1.20.x
+    - uses: actions/checkout@v3
+    - name: Configure git to use ssh
+      run: git config --global url."https://joshbuddy:${GH_ACCESS_TOKEN}@github.com/".insteadOf "https://github.com/"
+    - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+    - name: Run Gosec Security Scanner
+      uses: securego/gosec@master
+      with:
+        args: github.com/meow-io/roost
+    - run: go vet ./...
+    - run: govulncheck ./...

@@ -1,0 +1,24 @@
+#!/bin/sh
+
+set -e
+
+go build
+
+gomobile bind \
+	-tags "sqlite_fts5 sqlite_secure_delete" \
+	-trimpath \
+	-iosversion=14 \
+	-target ios,iossimulator,macos \
+	-v \
+	-o ./RoostCore.xcframework \
+	github.com/meow-io/roost
+
+# set +e
+
+# grep skipped RoostCore.xcframework/macos-arm64_x86_64/RoostCore.framework/Versions/A/Headers/Roost.objc.h
+
+# if [ $? -eq 0 ]
+# then
+#   echo "Some types were skipped, exiting"
+#   exit 1
+# fi

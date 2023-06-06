@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+
+set -e
+
+go get -v -u github.com/meow-io/go-slick@latest

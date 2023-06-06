@@ -1,0 +1,15 @@
+#!/bin/sh
+
+set -e
+
+go build 
+
+gomobile bind \
+	-tags "sqlite_fts5 sqlite_secure_delete" \
+	-trimpath \
+	-iosversion=14 \
+	-target ios \
+	-ldflags="-s -w" \
+	-v \
+	-o ./RoostCore.xcframework \
+	github.com/meow-io/roost
