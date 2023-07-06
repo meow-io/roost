@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/meow-io/go-slick"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,7 +31,7 @@ func makeRoost(root string) (*Roost, []interface{}, error) {
 		for {
 			updates.Next()
 			events = append(events, updates.item)
-			if updates.Type() == UpdateFinished {
+			if updates.Type() == UpdateAppState && updates.AppState().State == slick.StateInitialized {
 				break
 			}
 		}
@@ -96,7 +97,7 @@ func TestRoostShutdown(t *testing.T) {
 	teardownRoost(roost1, "roost1")
 	for {
 		u.Next()
-		if u.Type() == UpdateFinished {
+		if u.Type() == UpdateAppState && u.AppState().State == slick.StateInitialized {
 			break
 		}
 	}
@@ -393,6 +394,7 @@ func TestRoostCreateMessages(t *testing.T) {
 	require := require.New(t)
 	roost1, _, err := makeRoost("roost1")
 	defer teardownRoost(roost1, "roost1")
+	u := roost1.Updates()
 	require.Nil(err)
 	require.Nil(roost1.Initialize(password))
 	group, err := roost1.CreateGroup("group1")
@@ -403,6 +405,7 @@ func TestRoostCreateMessages(t *testing.T) {
 		_, err := group.CreateMessage(topics.Topic(0).ID, fmt.Sprintf("hello %d", i))
 		require.Nil(err)
 	}
+
 	page1, err := group.Messages(topics.Topic(0).ID, "")
 	require.Nil(err)
 	require.Equal(20, page1.Count)
@@ -415,6 +418,23 @@ func TestRoostCreateMessages(t *testing.T) {
 	require.Nil(err)
 	require.Equal(3, page3.Count)
 	require.Equal(true, page3.AtEnd)
+	entityCount := 0
+	require.Nil(roost1.Shutdown())
+updatesLoop:
+	for {
+		u.Next()
+		switch u.Type() {
+		case UpdateAppState:
+			if u.AppState().State == slick.StateInitialized {
+				break updatesLoop
+			}
+		case UpdateEntityUpdate:
+			if u.ViewEntityUpdate().viewName == "messages" {
+				entityCount++
+			}
+		}
+	}
+	require.Equal(43, entityCount)
 }
 
 func TestRoostMarkMessageRead(t *testing.T) {

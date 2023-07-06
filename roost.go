@@ -1,6 +1,7 @@
 package roost
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"text/template"
 	"time"
 
 	"github.com/meow-io/go-slick"
@@ -28,9 +30,8 @@ const (
 
 	UpdateAppState = iota
 	UpdateGroupUpdate
-	UpdateTableUpdate
-	UpdateTableRowUpdate
-	UpdateTableRowInsert
+	UpdateViewUpdate
+	UpdateEntityUpdate
 	UpdateIntroUpdate
 	UpdateTransportStateUpdate
 	UpdateMessagesFetched
@@ -44,7 +45,7 @@ func now() float64 {
 	return float64(time.Now().UnixMicro()) / 1000000
 }
 
-func val(i interface{}) eav.Value {
+func val(i interface{}) *eav.Value {
 	return eav.NewValue(i)
 }
 
@@ -54,6 +55,16 @@ func randomPosition(start, end float64) float64 {
 }
 
 type keyMaker func(*Roost, string) ([]byte, error)
+
+type ViewUpdate struct {
+	viewName string
+}
+
+type EntityUpdate struct {
+	viewName string
+	GroupID  []byte
+	EntityID []byte
+}
 
 const PageSize = 100
 
@@ -232,21 +243,6 @@ type IntroUpdate struct {
 	Type      int
 }
 
-type TableRowUpdate struct {
-	GroupID   []byte
-	ID        []byte
-	Name      string
-	Tablename string
-}
-
-type TableRowInsert struct {
-	GroupID   []byte
-	ID        []byte
-	TopicID   []byte
-	Name      string
-	Tablename string
-}
-
 type TransportStateUpdate struct {
 	URL   string
 	State string
@@ -281,8 +277,8 @@ func (t *TransportStates) State(i int) string {
 
 //		*AppState: an update about the current state of Roost
 //	  *GroupUpdate: an update about a group
-//	  *TableUpdate: an update about a specific table within roost, for instance `todos`, `topics` or `messages`.
-//	  *TableRowUpdate: an update about a specific table within roost, for instance `todos`, `topics` or `messages`.
+//	  *ViewUpdate: an update about a specific view within roost, for instance `todos`, `topics` or `messages`.
+//	  *EntityUpdate: an update about a specific view row within roost, for instance `todos`, `topics` or `messages`.
 //	  *IntroUpdate: an update about a specific table within roost, for instance `todos`, `topics` or `messages`.
 //	  *StateUpdate: an update about a specific table within roost, for instance `todos`, `topics` or `messages`.
 type Updates struct {
@@ -304,12 +300,10 @@ func (u *Updates) Type() int {
 		return UpdateAppState
 	case *slick.GroupUpdate:
 		return UpdateGroupUpdate
-	case *eav.TableUpdate:
-		return UpdateTableUpdate
-	case *eav.TableRowUpdate:
-		return UpdateTableRowUpdate
-	case *eav.TableRowInsert:
-		return UpdateTableRowInsert
+	case *ViewUpdate:
+		return UpdateViewUpdate
+	case *EntityUpdate:
+		return UpdateEntityUpdate
 	case *slick.IntroUpdate:
 		return UpdateIntroUpdate
 	case *slick.TransportStateUpdate:
@@ -339,13 +333,8 @@ func (u *Updates) GroupUpdate() *GroupUpdate {
 	}
 }
 
-func (u *Updates) TableUpdate() *TableUpdate {
-	tu := u.item.(*eav.TableUpdate)
-	return &TableUpdate{
-		ID:        tu.GroupID[:],
-		Name:      "eav",
-		Tablename: tu.Name,
-	}
+func (u *Updates) ViewUpdate() *ViewUpdate {
+	return u.item.(*ViewUpdate)
 }
 
 func (u *Updates) TransportStateUpdate() *TransportStateUpdate {
@@ -356,31 +345,8 @@ func (u *Updates) TransportStateUpdate() *TransportStateUpdate {
 	}
 }
 
-func (u *Updates) TableRowUpdate() *TableRowUpdate {
-	tu := u.item.(*eav.TableRowUpdate)
-	return &TableRowUpdate{
-		GroupID:   tu.GroupID[:],
-		ID:        tu.ID[:],
-		Name:      "eav",
-		Tablename: tu.Name,
-	}
-}
-
-func (u *Updates) TableRowInsert() *TableRowInsert {
-	tu := u.item.(*eav.TableRowInsert)
-
-	var topicID []byte
-	topicIDVal, ok := tu.Vals["topic_id"]
-	if ok {
-		topicID = topicIDVal.([]byte)
-	}
-	return &TableRowInsert{
-		GroupID:   tu.GroupID[:],
-		ID:        tu.ID[:],
-		Name:      "eav",
-		Tablename: tu.Name,
-		TopicID:   topicID,
-	}
+func (u *Updates) ViewEntityUpdate() *EntityUpdate {
+	return u.item.(*EntityUpdate)
 }
 
 func (u *Updates) IntroUpdate() *IntroUpdate {
@@ -474,6 +440,7 @@ type Roost struct {
 	State         int
 	keyMaker      keyMaker
 	heyaAuthToken string
+	updates       chan interface{}
 }
 
 // Makes a Roost instance with a given key maker. Not typically used outside of tests.
@@ -481,17 +448,276 @@ func MakeRoostWithKeyMaker(root, heyaAuthToken string, keyMaker keyMaker) (*Roos
 	c := config.NewConfig(config.WithLoggingPrefix(root), config.WithRootDir(root))
 	log := c.Logger("roost")
 
-	slick, err := slick.NewSlick(c)
+	updates := make(chan interface{}, 100)
+	s, err := slick.NewSlick(c, func(s *slick.Slick) error {
+		err := s.DB.Migrate("roost", []*migration.Migration{
+			{
+				Name: "Create initial tables",
+				Func: func(tx *sql.Tx) error {
+					if err := s.EAVCreateViews(map[string]*eav.ViewDefinition{
+						"messages": {
+							Columns: map[string]*eav.ColumnDefinition{
+								"body": {
+									SourceName: "message_body",
+									ColumnType: eav.Text,
+									Required:   true,
+									Nullable:   false,
+								},
+								"topic_id": {
+									SourceName: "message_topic_id",
+									ColumnType: eav.Blob,
+									Required:   true,
+									Nullable:   false,
+								},
+							},
+							Indexes: [][]string{{"_ctime"}, {"group_id", "topic_id"}},
+						},
+						"todos": {
+							Columns: map[string]*eav.ColumnDefinition{
+								"body": {
+									SourceName: "todo_body",
+									ColumnType: eav.Text,
+									Required:   true,
+									Nullable:   false,
+								},
+								"topic_id": {
+									SourceName: "todo_topic_id",
+									ColumnType: eav.Blob,
+									Required:   true,
+									Nullable:   false,
+								},
+								"read": {
+									SourceName:   "_self_todo_read",
+									ColumnType:   eav.Int,
+									DefaultValue: val(0),
+									Required:     false,
+									Nullable:     false,
+								},
+								"completed_at": {
+									SourceName:   "todo_completed_at",
+									ColumnType:   eav.Real,
+									DefaultValue: val(0),
+									Required:     false,
+									Nullable:     false,
+								},
+								"deleted": {
+									SourceName:   "todo_deleted",
+									ColumnType:   eav.Int,
+									DefaultValue: val(0),
+									Required:     false,
+									Nullable:     false,
+								},
+								"position": {
+									SourceName:   "todo_position",
+									ColumnType:   eav.Real,
+									DefaultValue: val(0),
+									Required:     false,
+									Nullable:     false,
+								},
+								"completed_position": {
+									SourceName:   "todo_completed_position",
+									ColumnType:   eav.Real,
+									DefaultValue: val(0),
+									Required:     false,
+									Nullable:     false,
+								},
+							},
+							Indexes: [][]string{{"_ctime"}, {"group_id", "topic_id", "read"}},
+						},
+						"topics": {
+							Columns: map[string]*eav.ColumnDefinition{
+								"label": {
+									SourceName: "topic_label",
+									ColumnType: eav.Text,
+									Required:   true,
+									Nullable:   false,
+								},
+								"message_last_read": {
+									SourceName:   "_self_topic_message_last_read",
+									ColumnType:   eav.Real,
+									DefaultValue: val(float64(0)),
+									Required:     false,
+									Nullable:     false,
+								},
+								"show_completed": {
+									SourceName:   "_self_topic_show_completed",
+									ColumnType:   eav.Int,
+									DefaultValue: val(0),
+									Required:     false,
+									Nullable:     false,
+								},
+								"position": {
+									SourceName:   "_self_topic_position",
+									ColumnType:   eav.Real,
+									Nullable:     false,
+									DefaultValue: val(0),
+								},
+								"pin_position": {
+									SourceName:   "_self_topic_pin_position",
+									ColumnType:   eav.Real,
+									Nullable:     false,
+									DefaultValue: val(0),
+								},
+								"pinned": {
+									SourceName:   "_self_topic_pinned",
+									ColumnType:   eav.Int,
+									Nullable:     false,
+									DefaultValue: val(0),
+								},
+							},
+							Indexes: [][]string{{"_ctime"}, {"group_id"}},
+						},
+						"reactions": {
+							Columns: map[string]*eav.ColumnDefinition{
+								"active": {
+									SourceName:   "reaction_active",
+									ColumnType:   eav.Int,
+									Nullable:     false,
+									DefaultValue: val(1),
+								},
+								"entity_id": {
+									SourceName: "reaction_entity_id",
+									ColumnType: eav.Blob,
+									Required:   true,
+									Nullable:   false,
+								},
+								"rune": {
+									SourceName: "reaction_rune",
+									ColumnType: eav.Text,
+									Required:   true,
+									Nullable:   false,
+								},
+							},
+							Indexes: [][]string{
+								{"group_id", "entity_id"},
+							},
+						},
+					}); err != nil {
+						return err
+					}
+
+					statementTmpl, err := template.New("index_statement").
+						Funcs(template.FuncMap{
+							"index_where": func(viewName, prefix string) (string, error) {
+								return s.EAVIndexWhere(viewName, prefix)
+							},
+							"selectors": func(viewName, prefix string, colName ...string) (string, error) {
+								return s.EAVSelectors(viewName, prefix, colName...)
+							},
+						}).Parse(`
+					CREATE TABLE fs_contents(
+					id INTEGER PRIMARY KEY,
+					group_id BINARY NOT NULL,
+					topic_id BINARY NOT NULL,
+					entity_id BINARY NOT NULL,
+					type STRING NOT NULL,
+					text STRING NOT NULL
+					);
+					CREATE UNIQUE INDEX content_group_entity on fs_contents(group_id, entity_id);
+
+					CREATE VIRTUAL TABLE fs_content_fts_idx USING fts5(text, content='fs_contents', content_rowid='id');
+
+					CREATE TRIGGER fs_content_fts_idx_ai AFTER INSERT ON fs_contents BEGIN
+					INSERT INTO fs_content_fts_idx(rowid, text) VALUES (new.id, new.text);
+					END;
+					CREATE TRIGGER fs_content_fts_idx_ad AFTER DELETE ON fs_contents BEGIN
+					INSERT INTO fs_content_fts_idx(fs_content_fts_idx, rowid, text) VALUES('delete', old.id, old.text);
+					END;
+					CREATE TRIGGER fs_content_fts_idx_au AFTER UPDATE ON fs_contents BEGIN
+					INSERT INTO fs_content_fts_idx('fs_content_fts_idx', rowid, text) VALUES('delete', old.id, old.text);
+					INSERT INTO fs_content_fts_idx(rowid, text) VALUES(new.id, new.text);
+					END;
+
+					insert into fs_contents (group_id, topic_id, entity_id, type, text) select group_id, topic_id, id, 'todo', body from todos;
+					insert into fs_contents (group_id, topic_id, entity_id, type, text) select group_id, topic_id, id, 'message', body from messages;
+
+					-- Trigger for ft indexing
+					CREATE TRIGGER todos_insert_contents AFTER INSERT ON _eav_data
+					WHEN ({{ index_where "todos"  "new." }})
+					BEGIN
+					INSERT INTO fs_contents
+						(group_id, topic_id, entity_id, text, type) VALUES
+						({{ selectors "todos" "new." "group_id" "topic_id" "id" "body" }}, 'todo');
+					END;
+					CREATE TRIGGER messages_insert_contents AFTER INSERT ON _eav_data
+					WHEN ({{ index_where "messages" "new." }})
+					BEGIN
+					INSERT INTO fs_contents
+						(group_id, topic_id, entity_id, text, type) VALUES
+						({{ selectors "messages" "new." "group_id" "topic_id" "id" "body" }}, 'message');
+					END;
+
+					CREATE TRIGGER eav_data_delete_contents AFTER DELETE ON _eav_data
+					WHEN ({{ index_where "todos" "old." }}) OR ({{ index_where "messages" "old." }})
+					BEGIN
+					DELETE FROM fs_contents WHERE entity_id = old.id AND group_id = old.group_id;
+					END;
+
+					CREATE TRIGGER todos_update_contents AFTER UPDATE ON _eav_data
+					WHEN ({{ index_where "todos"  "new." }})
+					BEGIN
+
+					UPDATE fs_contents set
+						text={{ selectors "todos" "new." "body"}},
+						topic_id = {{ selectors "todos" "new." "topic_id"}}
+					where
+						group_id = {{ selectors "todos" "new." "group_id"}} and entity_id = {{ selectors "todos" "new." "id"}};
+					END;
+
+					CREATE TRIGGER messages_update_contents AFTER UPDATE ON _eav_data
+					WHEN ({{ index_where "messages" "new." }})
+					BEGIN
+					UPDATE fs_contents set
+						text={{ selectors "messages" "new." "body"}},
+						topic_id = {{ selectors "messages" "new." "topic_id"}}
+					where
+						group_id = {{ selectors "messages" "new." "group_id"}} and entity_id = {{ selectors "messages" "new." "id"}};
+					END;
+					`)
+					if err != nil {
+						return err
+					}
+					var t bytes.Buffer
+					if err := statementTmpl.Execute(&t, nil); err != nil {
+						return err
+					}
+					sql := t.String()
+					if _, err := tx.Exec(sql); err != nil {
+						return err
+					}
+					return nil
+				},
+			},
+		})
+		if err != nil {
+			return err
+		}
+		s.EAVSubscribeAfterEntity(func(viewName string, groupID, id ids.ID) {
+			updates <- &EntityUpdate{viewName, groupID[:], id[:]}
+		}, false, "todos", "messages", "topics")
+
+		s.EAVSubscribeAfterView(func(viewName string) {
+			updates <- &ViewUpdate{viewName}
+		}, false, "todos", "messages", "topics")
+
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
+	u := s.Updates()
+	go func() {
+		for i := range u {
+			updates <- i
+		}
+	}()
 
 	state := StateNew
-	if slick.Initialized() {
+	if s.Initialized() {
 		state = StateLocked
 	}
 
-	return &Roost{log, slick, state, keyMaker, heyaAuthToken}, nil
+	return &Roost{log, s, state, keyMaker, heyaAuthToken, updates}, nil
 }
 
 // Makes a Roost instance for a given root directory.
@@ -679,7 +905,7 @@ func (r *Roost) RegisterHeyaTransport(authToken, host string, port int) error {
 //	  *GroupUpdate: an update about a group
 //	  *TableUpdate: an update about a specific table within roost, for instance `todos`, `topics` or `messages`.
 func (r *Roost) Updates() *Updates {
-	return &Updates{r.slick.Updates(), nil}
+	return &Updates{r.updates, nil}
 }
 
 // Return the number of unread messages across all topics and groups
@@ -717,218 +943,11 @@ func (r *Roost) updateState() error {
 		r.State = StateLocked
 		return nil
 	} else if r.slick.Running() {
-		if err := r.initialize(); err != nil {
-			return err
-		}
 		r.State = StateRunning
 		return nil
 	} else {
 		return errors.New("unknown state")
 	}
-}
-
-func (r *Roost) initialize() error {
-	return r.slick.DB.Migrate("roost", []*migration.Migration{
-		{
-			Name: "Create initial tables",
-			Func: func(tx *sql.Tx) error {
-				if err := r.slick.EAVCreateTables(map[string]*eav.TableDefinition{
-					"messages": {
-						Columns: map[string]*eav.ColumnDefinition{
-							"body": {
-								SourceName: "message_body",
-								ColumnType: eav.Text,
-								Required:   true,
-								Nullable:   false,
-							},
-							"topic_id": {
-								SourceName: "message_topic_id",
-								ColumnType: eav.Blob,
-								Required:   true,
-								Nullable:   false,
-							},
-						},
-						Indexes: [][]string{{"_ctime"}, {"group_id", "topic_id"}},
-					},
-					"todos": {
-						Columns: map[string]*eav.ColumnDefinition{
-							"body": {
-								SourceName: "todo_body",
-								ColumnType: eav.Text,
-								Required:   true,
-								Nullable:   false,
-							},
-							"topic_id": {
-								SourceName: "todo_topic_id",
-								ColumnType: eav.Blob,
-								Required:   true,
-								Nullable:   false,
-							},
-							"read": {
-								SourceName:   "_self_todo_read",
-								ColumnType:   eav.Int,
-								DefaultValue: val(0),
-								Required:     false,
-								Nullable:     false,
-							},
-							"completed_at": {
-								SourceName:   "todo_completed_at",
-								ColumnType:   eav.Real,
-								DefaultValue: val(0),
-								Required:     false,
-								Nullable:     false,
-							},
-							"deleted": {
-								SourceName:   "todo_deleted",
-								ColumnType:   eav.Int,
-								DefaultValue: val(0),
-								Required:     false,
-								Nullable:     false,
-							},
-							"position": {
-								SourceName:   "todo_position",
-								ColumnType:   eav.Real,
-								DefaultValue: val(0),
-								Required:     false,
-								Nullable:     false,
-							},
-							"completed_position": {
-								SourceName:   "todo_completed_position",
-								ColumnType:   eav.Real,
-								DefaultValue: val(0),
-								Required:     false,
-								Nullable:     false,
-							},
-						},
-						Indexes: [][]string{{"_ctime"}, {"group_id", "topic_id", "read"}},
-					},
-					"topics": {
-						Columns: map[string]*eav.ColumnDefinition{
-							"label": {
-								SourceName: "topic_label",
-								ColumnType: eav.Text,
-								Required:   true,
-								Nullable:   false,
-							},
-							"message_last_read": {
-								SourceName:   "_self_topic_message_last_read",
-								ColumnType:   eav.Real,
-								DefaultValue: val(float64(0)),
-								Required:     false,
-								Nullable:     false,
-							},
-							"show_completed": {
-								SourceName:   "_self_topic_show_completed",
-								ColumnType:   eav.Int,
-								DefaultValue: val(0),
-								Required:     false,
-								Nullable:     false,
-							},
-							"position": {
-								SourceName:   "_self_topic_position",
-								ColumnType:   eav.Real,
-								Nullable:     false,
-								DefaultValue: val(0),
-							},
-							"pin_position": {
-								SourceName:   "_self_topic_pin_position",
-								ColumnType:   eav.Real,
-								Nullable:     false,
-								DefaultValue: val(0),
-							},
-							"pinned": {
-								SourceName:   "_self_topic_pinned",
-								ColumnType:   eav.Int,
-								Nullable:     false,
-								DefaultValue: val(0),
-							},
-						},
-						Indexes: [][]string{{"_ctime"}, {"group_id"}},
-					},
-					"reactions": {
-						Columns: map[string]*eav.ColumnDefinition{
-							"active": {
-								SourceName:   "reaction_active",
-								ColumnType:   eav.Int,
-								Required:     true,
-								Nullable:     false,
-								DefaultValue: val(1),
-							},
-							"entity_id": {
-								SourceName: "reaction_entity_id",
-								ColumnType: eav.Blob,
-								Required:   true,
-								Nullable:   false,
-							},
-							"rune": {
-								SourceName: "reaction_rune",
-								ColumnType: eav.Text,
-								Required:   true,
-								Nullable:   false,
-							},
-						},
-						Indexes: [][]string{
-							{"group_id", "entity_id"},
-						},
-					},
-				}); err != nil {
-					return err
-				}
-
-				_, err := tx.Exec(`
-CREATE TABLE fs_contents(
-id INTEGER PRIMARY KEY,
-group_id BINARY NOT NULL,
-topic_id BINARY NOT NULL,
-entity_id BINARY NOT NULL,
-type STRING NOT NULL,
-text STRING NOT NULL
-);
-CREATE UNIQUE INDEX content_group_entity on fs_contents(group_id, entity_id);
-
-CREATE VIRTUAL TABLE fs_content_fts_idx USING fts5(text, content='fs_contents', content_rowid='id');
-
-CREATE TRIGGER fs_content_fts_idx_ai AFTER INSERT ON fs_contents BEGIN
-INSERT INTO fs_content_fts_idx(rowid, text) VALUES (new.id, new.text);
-END;
-CREATE TRIGGER fs_content_fts_idx_ad AFTER DELETE ON fs_contents BEGIN
-INSERT INTO fs_content_fts_idx(fs_content_fts_idx, rowid, text) VALUES('delete', old.id, old.text);
-END;
-CREATE TRIGGER fs_content_fts_idx_au AFTER UPDATE ON fs_contents BEGIN
-INSERT INTO fs_content_fts_idx('fs_content_fts_idx', rowid, text) VALUES('delete', old.id, old.text);
-INSERT INTO fs_content_fts_idx(rowid, text) VALUES(new.id, new.text);
-END;
-
-insert into fs_contents (group_id, topic_id, entity_id, type, text) select group_id, topic_id, id, 'todo', body from todos;
-insert into fs_contents (group_id, topic_id, entity_id, type, text) select group_id, topic_id, id, 'message', body from messages;
-
--- Todo related triggers
-CREATE TRIGGER todo_insert_contents AFTER INSERT ON todos BEGIN
-INSERT INTO fs_contents (group_id, topic_id, entity_id, type, text) VALUES (new.group_id, new.topic_id, new.id, 'todo', new.body);
-END;
-CREATE TRIGGER todo_delete_contents AFTER DELETE ON todos BEGIN
-DELETE FROM fs_contents WHERE entity_id = old.id AND group_id = old.group_id;
-END;
-CREATE TRIGGER todo_update_contents AFTER UPDATE ON todos BEGIN
-UPDATE fs_contents set text=new.body, topic_id = new.topic_id where group_id = new.group_id and entity_id = new.id;
-END;
-
--- Message related triggers
-CREATE TRIGGER message_insert_contents AFTER INSERT ON messages BEGIN
-INSERT INTO fs_contents (group_id, topic_id, entity_id, type, text) VALUES (new.group_id, new.topic_id, new.id, 'message', new.body);
-END;
-CREATE TRIGGER message_delete_contents AFTER DELETE ON messages BEGIN
-DELETE FROM fs_contents WHERE entity_id = old.id AND group_id = old.group_id;
-END;
-CREATE TRIGGER message_update_contents AFTER UPDATE ON messages BEGIN
-UPDATE fs_contents set text=new.body, topic_id = new.topic_id where group_id = new.group_id and entity_id = new.id;
-END;
-
-						`)
-				return err
-			},
-		},
-	})
 }
 
 // Perform a fulltext search across all your Roosts.
